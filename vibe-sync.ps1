@@ -54,7 +54,7 @@ Write-Host "Project Path : $LocalPath" -ForegroundColor Gray
 Write-Host "Context File : $ContextFile" -ForegroundColor Gray
 
 # Default exclusion list for Repomix so repo-context.txt stays clean & under 7 MB
-$IgnoreList = @(
+$BaseIgnoreItems = @(
     ".git", ".svn", ".hg", ".idea", ".vscode", ".vs",
     "node_modules", "bower_components", "jspm_packages",
     ".venv", "venv", "env", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -69,7 +69,64 @@ $IgnoreList = @(
     ".vibebridge-state", "repo-context.txt",
     "apply-changes.txt", "apply-changes (*).txt", "apply-changes.failed*.txt",
     "apply-changes.ps1", "apply-changes.failed*.ps1"
-) -join ","
+)
+$IgnoreList = $BaseIgnoreItems -join ","
+
+function Get-EffectiveIgnoreList {
+    # Read root .gitignore (if missing or not a file, treat it as blank) and combine with $BaseIgnoreItems
+    $GitIgnoreFile = Join-Path $LocalPath ".gitignore"
+    $Combined = [System.Collections.Generic.List[string]]::new()
+    $Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($Item in $BaseIgnoreItems) {
+        if ($Seen.Add($Item)) {
+            $Combined.Add($Item)
+        }
+    }
+
+    if (Test-Path -LiteralPath $GitIgnoreFile -PathType Leaf) {
+        try {
+            $Lines = [System.IO.File]::ReadAllLines($GitIgnoreFile, [System.Text.Encoding]::UTF8)
+            foreach ($RawLine in $Lines) {
+                $Line = $RawLine -replace '(?<!\\)\s+$', ''
+                $Trimmed = $Line.TrimStart()
+                if ([string]::IsNullOrWhiteSpace($Trimmed) -or $Trimmed.StartsWith('#')) {
+                    continue
+                }
+                # Negation rules (!) and comma-containing patterns are enforced by Remove-GitIgnoredFromPackedJson
+                if ($Trimmed.StartsWith('!') -or $Trimmed.Contains(',')) {
+                    continue
+                }
+                if ($Trimmed.StartsWith('\#') -or $Trimmed.StartsWith('\!')) {
+                    $Trimmed = $Trimmed.Substring(1)
+                }
+                $Pattern = $Trimmed.Replace('\', '/')
+                if ($Pattern.StartsWith('/')) {
+                    $Pattern = $Pattern.Substring(1)
+                }
+                if ([string]::IsNullOrWhiteSpace($Pattern)) {
+                    continue
+                }
+                if ($Pattern.EndsWith('/')) {
+                    $DirPat = $Pattern.TrimEnd('/')
+                    if (-not [string]::IsNullOrWhiteSpace($DirPat)) {
+                        foreach ($Candidate in @($DirPat, "$DirPat/**")) {
+                            if ($Seen.Add($Candidate)) {
+                                $Combined.Add($Candidate)
+                            }
+                        }
+                    }
+                } else {
+                    if ($Seen.Add($Pattern)) {
+                        $Combined.Add($Pattern)
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    return ($Combined -join ",")
+}
 
 function Invoke-NodeHelper([string]$ScriptContent, [string[]]$Arguments = @()) {
     # Write script to a temporary .cjs file inside .vibebridge-state instead of using node.exe -e
@@ -83,22 +140,208 @@ function Invoke-NodeHelper([string]$ScriptContent, [string[]]$Arguments = @()) {
     }
 }
 
+function Remove-GitIgnoredFromPackedJson([string]$PackedJsonPath) {
+    # Filter packed Repomix JSON against root .gitignore (treating missing .gitignore as blank)
+    # so any files, folders, or other items ignored in .gitignore are excluded from repo-context.txt.
+    $FilterScript = @'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const localPath = process.argv[2];
+const packedFile = process.argv[3];
+const gitignorePath = path.join(localPath, ".gitignore");
+
+let gitignoreText = "";
+try {
+    if (fs.existsSync(gitignorePath) && fs.statSync(gitignorePath).isFile()) {
+        gitignoreText = fs.readFileSync(gitignorePath, "utf8");
+    }
+} catch {
+    gitignoreText = "";
+}
+
+function compileRule(rawLine) {
+    let line = rawLine.replace(/\r$/, "").replace(/(?<!\\)\s+$/, "");
+    if (!line || line.startsWith("#")) return null;
+
+    let negated = false;
+    if (line.startsWith("!")) {
+        negated = true;
+        line = line.slice(1);
+    } else if (line.startsWith("\\#") || line.startsWith("\\!")) {
+        line = line.slice(1);
+    }
+
+    let dirOnly = line.endsWith("/");
+    if (dirOnly) line = line.replace(/\/+$/, "");
+    if (!line) return null;
+
+    const anchored = line.includes("/");
+    if (line.startsWith("/")) line = line.slice(1);
+    if (!line) return null;
+
+    let pat = "";
+    for (let i = 0; i < line.length; ) {
+        const c = line[i];
+        if (c === "\\" && i + 1 < line.length) {
+            pat += line[i + 1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            i += 2;
+        } else if (c === "*") {
+            if (line[i + 1] === "*") {
+                if (line[i + 2] === "/") {
+                    pat += "(?:.+/)?";
+                    i += 3;
+                } else {
+                    pat += ".*";
+                    i += 2;
+                }
+            } else {
+                pat += "[^/]*";
+                i++;
+            }
+        } else if (c === "?") {
+            pat += "[^/]";
+            i++;
+        } else if (".+^$()|{}[]".includes(c)) {
+            pat += "\\" + c;
+            i++;
+        } else {
+            pat += c;
+            i++;
+        }
+    }
+
+    const regexStr = anchored ? `^(?:${pat})$` : `^(?:.+/)?(?:${pat})$`;
+    return { negated, dirOnly, regex: new RegExp(regexStr, "i") };
+}
+
+const rules = gitignoreText
+    .split(/\n/)
+    .map(compileRule)
+    .filter(Boolean);
+
+if (rules.length === 0) process.exit(0);
+
+function isPathIgnored(relPath, isDirectory = false) {
+    const norm = String(relPath).replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    if (!norm) return false;
+    const parts = norm.split("/");
+
+    // If any parent directory is ignored (and not unignored before descending), all children are ignored
+    for (let depth = 1; depth < parts.length; depth++) {
+        const dirPath = parts.slice(0, depth).join("/");
+        let dirIgnored = false;
+        for (const r of rules) {
+            if (r.regex.test(dirPath)) {
+                dirIgnored = !r.negated;
+            }
+        }
+        if (dirIgnored) return true;
+    }
+
+    let itemIgnored = false;
+    for (const r of rules) {
+        if (r.dirOnly && !isDirectory) continue;
+        if (r.regex.test(norm)) {
+            itemIgnored = !r.negated;
+        }
+    }
+    return itemIgnored;
+}
+
+const packed = JSON.parse(fs.readFileSync(packedFile, "utf8"));
+let modified = false;
+
+if (packed && packed.files && typeof packed.files === "object" && !Array.isArray(packed.files)) {
+    for (const relPath of Object.keys(packed.files)) {
+        if (isPathIgnored(relPath, false)) {
+            delete packed.files[relPath];
+            modified = true;
+        }
+    }
+}
+
+if (packed && typeof packed.directoryStructure === "string" && packed.directoryStructure.length > 0) {
+    const rawLines = packed.directoryStructure.split(/\r?\n/);
+    const entries = [];
+    const stack = [];
+    for (const raw of rawLines) {
+        const stripped = raw.replace(/^ +/, "");
+        if (!stripped) continue;
+        const indent = Math.floor((raw.length - stripped.length) / 2);
+        const isDir = stripped.endsWith("/");
+        const name = isDir ? stripped.slice(0, -1) : stripped;
+        stack.length = indent;
+        stack.push(name);
+        entries.push({
+            raw,
+            indent,
+            isDir,
+            relPath: stack.join("/")
+        });
+    }
+
+    const keptFilePaths = entries
+        .filter((e) => !e.isDir && !isPathIgnored(e.relPath, false))
+        .map((e) => e.relPath);
+
+    const outLines = [];
+    for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        if (!e.isDir) {
+            if (!isPathIgnored(e.relPath, false)) {
+                outLines.push(e.raw);
+            } else {
+                modified = true;
+            }
+        } else {
+            if (isPathIgnored(e.relPath, true)) {
+                modified = true;
+                continue;
+            }
+            const prefix = e.relPath + "/";
+            const hasKeptFile = keptFilePaths.some((fp) => fp.startsWith(prefix));
+            const hadChildren = i + 1 < entries.length && entries[i + 1].indent > e.indent;
+            if (hasKeptFile || !hadChildren) {
+                outLines.push(e.raw);
+            } else {
+                modified = true;
+            }
+        }
+    }
+
+    const newStructure = outLines.join("\n");
+    if (newStructure !== packed.directoryStructure) {
+        packed.directoryStructure = newStructure;
+        modified = true;
+    }
+}
+
+if (modified) {
+    fs.writeFileSync(packedFile, JSON.stringify(packed, null, 2), "utf8");
+}
+'@
+    Invoke-NodeHelper -ScriptContent $FilterScript -Arguments @($LocalPath, $PackedJsonPath)
+}
+
 function Invoke-RepoPack {
     $TimeStr = (Get-Date).ToString("HH:mm:ss")
     Write-Host "`n[$TimeStr] [PACK] Packing '$ProjectName' into repo-context.txt..." -ForegroundColor Cyan
 
+    $EffectiveIgnoreList = Get-EffectiveIgnoreList
     $PackedFile = Join-Path $StateDir ('packed-' + [guid]::NewGuid().ToString('N') + '.json')
     try {
         if (Get-Command repomix.cmd -ErrorAction SilentlyContinue) {
-            repomix.cmd $LocalPath --style json --output $PackedFile --ignore $IgnoreList | Out-Null
+            repomix.cmd $LocalPath --style json --output $PackedFile --ignore $EffectiveIgnoreList | Out-Null
         } elseif (Get-Command npx.cmd -ErrorAction SilentlyContinue) {
-            npx.cmd --yes repomix $LocalPath --style json --output $PackedFile --ignore $IgnoreList | Out-Null
+            npx.cmd --yes repomix $LocalPath --style json --output $PackedFile --ignore $EffectiveIgnoreList | Out-Null
         } else {
             throw 'Repomix and npx are missing. Run setup.ps1 from the bridge folder.'
         }
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $PackedFile -PathType Leaf)) {
             throw 'Repomix did not generate a snapshot.'
         }
+        Remove-GitIgnoredFromPackedJson $PackedFile
         node.exe $DeltaTool snapshot $LocalPath $PackedFile $ContextFile | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) { throw 'Could not publish the v2 snapshot.' }
     } catch {

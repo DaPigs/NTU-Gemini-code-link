@@ -36,6 +36,7 @@ For all `/vibecode` tasks:
    - All file operations (`edit`, `create`, `delete`) operate strictly on UTF-8 text files.
 4. **Output `apply-changes.txt` as a downloadable file in the chat.**
    - Write the exact two-line ASCII output of `pack_delta()` to `apply-changes.txt` in the current working directory of the Python code interpreter (`Path("apply-changes.txt").write_bytes(content.encode("ascii"))`) so the user can download `apply-changes.txt` and drag it directly into their local project folder.
+   - Do not output other files, keep all changes in `apply-changes.txt`, unless instructed by the user.
 
 ## Read the initial snapshot or initialize a new project
 
